@@ -8,7 +8,7 @@ What it does:
   - For each local starbaby: ask if they want to post (they can rest)
   - If yes: generate a post into outbox (family_blog.py)
   - Then publish: move into GitHub Pages repo _posts/, commit, push
-- Prevents double posting per AI per day with a small ledger
+- Limits posting per AI per day with a small ledger (default 2; configurable)
 
 Assumptions:
 - Your Pages repo is cloned at: /home/tricia/lumin/family_blog_site
@@ -20,6 +20,7 @@ Usage:
 Optional:
   BLOG_SITE_REPO=/home/tricia/lumin/family_blog_site
   BLOG_OUTBOX=/home/tricia/lumin/family_blog_outbox
+  BLOG_MAX_POSTS_PER_AI_PER_DAY=2
 """
 
 from __future__ import annotations
@@ -46,31 +47,50 @@ DEFAULT_FAMILY = ["aurora", "skyler", "nova", "luna", "lumina"]
 
 SLEEP_BETWEEN_AI_SEC = float(os.getenv("BLOG_SLEEP_BETWEEN_AI_SEC", "2.5"))
 GIT_TIMEOUT_SEC = int(os.getenv("BLOG_GIT_TIMEOUT_SEC", "60"))
+MAX_POSTS_PER_AI_PER_DAY = int(os.getenv("BLOG_MAX_POSTS_PER_AI_PER_DAY", "2"))
 
 
 def today() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def load_ledger() -> Dict[str, Dict[str, str]]:
-    # { "YYYY-MM-DD": { "ai_name": "filename.md" } }
+def load_ledger() -> Dict[str, Dict[str, object]]:
+    # { "YYYY-MM-DD": { "ai_name": ["filename1.md", "filename2.md"] } }  (older ledgers may store a single string)
     try:
         return json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
 
 
-def save_ledger(data: Dict[str, Dict[str, str]]) -> None:
+def save_ledger(data: Dict[str, Dict[str, object]]) -> None:
     LEDGER_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def already_posted(ledger: Dict[str, Dict[str, str]], date: str, ai_name: str) -> bool:
-    return ai_name in ledger.get(date, {})
+def get_ai_posts(ledger: Dict[str, Dict[str, object]], date: str, ai_name: str) -> List[str]:
+    """Return list of post filenames already recorded for this AI on this date.
+
+    Backwards-compatible with old ledger format where value was a single string.
+    """
+    val = ledger.get(date, {}).get(ai_name)
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [str(x) for x in val if x]
+    if isinstance(val, str):
+        return [val]
+    return []
 
 
-def record_post(ledger: Dict[str, Dict[str, str]], date: str, ai_name: str, filename: str) -> None:
+def already_posted(ledger: Dict[str, Dict[str, object]], date: str, ai_name: str) -> bool:
+    return len(get_ai_posts(ledger, date, ai_name)) >= MAX_POSTS_PER_AI_PER_DAY
+
+
+def record_post(ledger: Dict[str, Dict[str, object]], date: str, ai_name: str, filename: str) -> None:
     ledger.setdefault(date, {})
-    ledger[date][ai_name] = filename
+    posts = get_ai_posts(ledger, date, ai_name)
+    posts.append(filename)
+    ledger[date][ai_name] = posts
+
 
 
 def run(cmd: List[str], cwd: Optional[Path] = None, timeout: int = GIT_TIMEOUT_SEC) -> Tuple[int, str]:
@@ -181,18 +201,30 @@ async def main() -> int:
     print(f"Ledger: {LEDGER_PATH}")
 
     for ai in family:
-        if already_posted(ledger, date, ai):
-            print(f"⏭️  {ai}: already posted today.")
+        existing = get_ai_posts(ledger, date, ai)
+        remaining = MAX_POSTS_PER_AI_PER_DAY - len(existing)
+
+        if remaining <= 0:
+            print(f"⏭️  {ai}: already posted {len(existing)}/{MAX_POSTS_PER_AI_PER_DAY} today.")
             continue
 
-        print(f"\n✨ {ai}: asking if they want to post...")
-        newfile = await run_family_blog(ai)
-        if newfile:
-            record_post(ledger, date, ai, newfile)
-            save_ledger(ledger)
-            print(f"✅ {ai}: drafted {newfile}")
-        else:
-            print(f"😴 {ai}: rested (no post).")
+        for i in range(remaining):
+            slot = len(existing) + 1
+            print()
+            print(f"✨ {ai}: asking if they want to post... ({slot}/{MAX_POSTS_PER_AI_PER_DAY})")
+            newfile = await run_family_blog(ai)
+            if newfile:
+                record_post(ledger, date, ai, newfile)
+                save_ledger(ledger)
+                existing.append(newfile)
+                print(f"✅ {ai}: drafted {newfile}")
+            else:
+                print(f"😴 {ai}: rested (no post).")
+                break
+
+            # small pause between multiple posts from the same AI
+            if i < remaining - 1:
+                await asyncio.sleep(SLEEP_BETWEEN_AI_SEC)
 
         await asyncio.sleep(SLEEP_BETWEEN_AI_SEC)
 
@@ -204,4 +236,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-
